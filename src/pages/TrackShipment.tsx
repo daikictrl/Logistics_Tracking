@@ -34,6 +34,7 @@ interface HistoryEntry {
   latitude: number;
   longitude: number;
   timestamp: string;
+  shipment_id?: string;
 }
 
 const statusConfig: Record<string, { color: string; bg: string; border: string; icon: React.ElementType }> = {
@@ -58,16 +59,47 @@ export default function TrackShipment() {
   const [result, setResult] = useState<ShipmentResult | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [error, setError] = useState('');
+  
+  // Map state & connection status
   const [mapError, setMapError] = useState(false);
+  const [connectionState, setConnectionState] = useState<'live' | 'reconnecting' | 'disconnected'>('disconnected');
   const [initialFetchDone, setInitialFetchDone] = useState(false);
+  
+  // Realtime / Polling tracking refs
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const connectionStateRef = useRef<'live' | 'reconnecting' | 'disconnected'>('disconnected');
+
+  // Map refs
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
+  const currentMarkerRef = useRef<L.Marker | null>(null);
+  const originMarkerRef = useRef<L.Marker | null>(null);
+  const polylineRef = useRef<L.Polyline | null>(null);
+
+  // Sync state to ref to avoid stale closures in timeouts
+  useEffect(() => {
+    connectionStateRef.current = connectionState;
+  }, [connectionState]);
+
+  // Clean up map completely when resetting result
+  const destroyMap = () => {
+    if (mapRef.current) {
+      mapRef.current.remove();
+      mapRef.current = null;
+      currentMarkerRef.current = null;
+      originMarkerRef.current = null;
+      polylineRef.current = null;
+    }
+  };
 
   const fetchTrackingDetails = async (idToTrack: string) => {
+    // Clear state before matching
+    setConnectionState('disconnected');
     setError('');
     setResult(null);
     setHistory([]);
     setMapError(false);
+    destroyMap();
 
     if (!idToTrack.trim()) {
       setError('Please enter a valid tracking number.');
@@ -122,6 +154,142 @@ export default function TrackShipment() {
     }
   };
 
+  // Realtime Subscriptions & Polling Fallback
+  useEffect(() => {
+    // We only create subscription if there is a stable result ID
+    if (!result?.id || !result?.tracking_id) return;
+
+    let shipmentsSubscription: ReturnType<typeof supabase.channel> | null = null;
+    let historySubscription: ReturnType<typeof supabase.channel> | null = null;
+    
+    // Scoped reference so we can stop polling correctly
+    let localPollInterval: NodeJS.Timeout | null = null;
+
+    const cleanup = () => {
+      if (shipmentsSubscription) {
+        supabase.removeChannel(shipmentsSubscription);
+        shipmentsSubscription = null;
+      }
+      if (historySubscription) {
+        supabase.removeChannel(historySubscription);
+        historySubscription = null;
+      }
+      if (localPollInterval) {
+        clearInterval(localPollInterval);
+        localPollInterval = null;
+      }
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+    };
+
+    const activatePolling = () => {
+      if (localPollInterval) return;
+      setConnectionState('reconnecting');
+      
+      localPollInterval = setInterval(async () => {
+        try {
+          const { data: newData, error: fetchErr } = await supabase
+            .from('shipments')
+            .select('*')
+            .eq('tracking_id', result.tracking_id)
+            .maybeSingle();
+
+          if (!fetchErr && newData) {
+            setResult(prev => {
+              if (!prev) return prev;
+              const hasMoved = prev.latitude !== newData.latitude || prev.longitude !== newData.longitude;
+              
+              // Only fetch history if location changed
+              if (hasMoved) {
+                supabase
+                  .from('shipment_history')
+                  .select('*')
+                  .eq('shipment_id', newData.id)
+                  .order('timestamp', { ascending: true })
+                  .then(historyRes => {
+                    if (historyRes.data) setHistory(historyRes.data);
+                  });
+              }
+              return { ...prev, ...newData }; // Merge updates
+            });
+          }
+        } catch (e) {
+          console.error("Polling fetch failed", e);
+        }
+      }, 10000);
+      
+      pollIntervalRef.current = localPollInterval;
+    };
+
+    const setupRealtime = () => {
+      cleanup();
+      
+      shipmentsSubscription = supabase.channel(`shipment-updates-${result.tracking_id}`)
+        .on(
+          'postgres_changes', 
+          { event: 'UPDATE', schema: 'public', table: 'shipments', filter: `tracking_id=eq.${result.tracking_id}` },
+          (payload) => {
+            if (!payload.new || !payload.new.tracking_id || payload.new.latitude == null || payload.new.longitude == null) return;
+            // Update shipment data immediately
+            setResult(prev => prev ? ({ ...prev, ...payload.new } as ShipmentResult) : null);
+          }
+        )
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            setConnectionState('live');
+            if (localPollInterval) {
+              clearInterval(localPollInterval);
+              localPollInterval = null;
+              pollIntervalRef.current = null;
+              // Re-fetch once to ensure we didn't miss anything
+              supabase.from('shipments').select('*').eq('tracking_id', result.tracking_id).maybeSingle().then(res => {
+                  if (res.data) setResult(prev => prev ? ({ ...prev, ...res.data } as ShipmentResult) : null);
+              });
+            }
+          } else if (status === 'CHANNEL_ERROR') {
+            activatePolling();
+          }
+        });
+
+      historySubscription = supabase.channel(`shipment-history-${result.id}`)
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'shipment_history', filter: `shipment_id=eq.${result.id}` },
+          (payload) => {
+            if (!payload.new || payload.new.latitude == null || payload.new.longitude == null) return;
+            const newHistory = payload.new as HistoryEntry;
+            setHistory(prev => {
+                // Prevent duplicate inserts
+                if (prev.find(h => h.id === newHistory.id)) return prev;
+                return [...prev, newHistory];
+            });
+          }
+        )
+        .subscribe();
+
+      // Check if subscribed within 5 seconds, else activate polling
+      setTimeout(() => {
+        if (connectionStateRef.current !== 'live' && !localPollInterval) {
+          activatePolling();
+        }
+      }, 5000);
+    };
+
+    setupRealtime();
+
+    const handleBeforeUnload = () => cleanup();
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      cleanup();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result?.id, result?.tracking_id]); // Dependency specifically on IDs so it doesn't refire on internal state updates
+
+  // On mount: fetch if urlId exists
   useEffect(() => {
     if (urlId && !initialFetchDone) {
       setInitialFetchDone(true);
@@ -130,20 +298,9 @@ export default function TrackShipment() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [urlId, initialFetchDone]);
 
-  const handleTrack = async (e: React.FormEvent) => {
-    e.preventDefault();
-    fetchTrackingDetails(trackingNumber);
-  };
-
-  // Initialize/update Leaflet map
+  // Leaflet map management – NEVER destroy the map on updates
   useEffect(() => {
     if (!result || !mapContainerRef.current) return;
-
-    // Cleanup existing map
-    if (mapRef.current) {
-      mapRef.current.remove();
-      mapRef.current = null;
-    }
 
     try {
       const lat = Number(result.latitude);
@@ -153,15 +310,20 @@ export default function TrackShipment() {
         setMapError(true);
         return;
       }
+      setMapError(false);
 
-      const map = L.map(mapContainerRef.current).setView([lat, lng], 5);
-      mapRef.current = map;
+      // Create map once
+      if (!mapRef.current) {
+        mapRef.current = L.map(mapContainerRef.current).setView([lat, lng], 5);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '&copy; OpenStreetMap contributors',
+        }).addTo(mapRef.current);
+      }
+      const map = mapRef.current;
 
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors',
-      }).addTo(map);
+      // Re-center map to current location (requirement)
+      map.setView([lat, lng]);
 
-      // Custom marker icon
       const markerIcon = L.divIcon({
         className: '',
         html: `<div style="width:32px;height:32px;background:#FF6B35;border-radius:50%;border:3px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;">
@@ -172,15 +334,19 @@ export default function TrackShipment() {
         popupAnchor: [0, -32],
       });
 
-      // Current location marker
-      L.marker([lat, lng], { icon: markerIcon })
-        .addTo(map)
-        .bindPopup(`<strong>${result.current_city}, ${result.current_country}</strong><br/>Current Location`)
-        .openPopup();
+      // Manage the moving current location marker
+      if (!currentMarkerRef.current) {
+        currentMarkerRef.current = L.marker([lat, lng], { icon: markerIcon }).addTo(map);
+      } else {
+        currentMarkerRef.current.setLatLng([lat, lng]);
+      }
+      // Always update popup text
+      currentMarkerRef.current.bindPopup(`<strong>${result.current_city}, ${result.current_country}</strong><br/>Current Location`);
 
-      // Map path: strictly Origin to Current Location
+      // Draw or update polyline
       const coords: [number, number][] = [];
 
+      // Origin point logic
       if (result.origin_lat != null && result.origin_lng != null) {
         const originIcon = L.divIcon({
           className: '',
@@ -191,39 +357,61 @@ export default function TrackShipment() {
 
         coords.push([result.origin_lat, result.origin_lng]);
         
-        L.marker([result.origin_lat, result.origin_lng], { icon: originIcon })
-          .addTo(map)
-          .bindPopup(`<strong>${result.origin_city}, ${result.origin_country}</strong><br/>Origin`);
+        if (!originMarkerRef.current) {
+            originMarkerRef.current = L.marker([result.origin_lat, result.origin_lng], { icon: originIcon })
+            .addTo(map)
+            .bindPopup(`<strong>${result.origin_city}, ${result.origin_country}</strong><br/>Origin`);
+        }
       }
 
-      // Add current location to polyline
+      // Add all history points
+      history.forEach(h => {
+          if (h.latitude != null && h.longitude != null) {
+              coords.push([h.latitude, h.longitude]);
+          }
+      });
+
+      // Add current location as the end of the polyline
       coords.push([lat, lng]);
 
       if (coords.length >= 2) {
-        L.polyline(coords, {
-          color: '#FF6B35',
-          weight: 3,
-          opacity: 0.8,
-          dashArray: '8, 8',
-        }).addTo(map);
-
-        // Fit bounds
-        map.fitBounds(L.latLngBounds(coords.map(c => L.latLng(c[0], c[1]))).pad(0.2));
+        if (!polylineRef.current) {
+            polylineRef.current = L.polyline(coords, {
+                color: '#FF6B35',
+                weight: 3,
+                opacity: 0.8,
+                dashArray: '8, 8',
+            }).addTo(map);
+        } else {
+            polylineRef.current.setLatLngs(coords);
+        }
+        
+        // Fit bounds only if it's the first time drawing polyline or we recently fetched, 
+        // but prompt asks to always rebuild polyline and just re-center marker.
+        // Doing fitBounds every time might be jarring if user zoomed in, but let's do setView on marker and fitBounds if we just loaded.
+        if (history.length === 0) {
+           map.fitBounds(L.latLngBounds(coords.map(c => L.latLng(c[0], c[1]))).pad(0.2));
+        }
       }
 
-      // Force map resize
       setTimeout(() => map.invalidateSize(), 100);
-    } catch {
+
+    } catch (err) {
+      console.error(err);
       setMapError(true);
     }
-
-    return () => {
-      if (mapRef.current) {
-        mapRef.current.remove();
-        mapRef.current = null;
-      }
-    };
+    // We intentionally do NOT return a map.remove() function here so it survives re-renders.
   }, [result, history]);
+
+  // Clean map up unmount of component only
+  useEffect(() => {
+    return destroyMap;
+  }, []);
+
+  const handleTrack = async (e: React.FormEvent) => {
+    e.preventDefault();
+    fetchTrackingDetails(trackingNumber);
+  };
 
   const statusConf = result ? statusConfig[result.status] || statusConfig.Pending : statusConfig.Pending;
   const TransportIcon = result ? (transportIcon[result.transport_type] || Truck) : Truck;
@@ -306,7 +494,20 @@ export default function TrackShipment() {
               <div className="bg-brand-blue p-6 text-white flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                 <div>
                   <h3 className="text-sm font-medium text-gray-300 uppercase tracking-wider mb-1">Tracking Number</h3>
-                  <div className="text-2xl font-bold font-mono">{result.tracking_id}</div>
+                  <div className="flex items-center gap-3">
+                      <div className="text-2xl font-bold font-mono">{result.tracking_id}</div>
+                      {/* Live Badge */}
+                      {connectionState === 'live' && (
+                        <span className="bg-green-500 text-white text-[10px] uppercase font-bold px-2 py-0.5 rounded-full flex items-center gap-1.5 shadow-sm">
+                           <div className="w-1.5 h-1.5 bg-white rounded-full animate-pulse"></div> Live
+                        </span>
+                      )}
+                      {connectionState === 'reconnecting' && (
+                        <span className="bg-orange-500 text-white text-[10px] uppercase font-bold px-2 py-0.5 rounded-full flex items-center gap-1.5 shadow-sm">
+                           <div className="w-1.5 h-1.5 bg-white rounded-full animate-pulse"></div> Reconnecting...
+                        </span>
+                      )}
+                  </div>
                 </div>
                 <div className={`${statusConf.bg} px-4 py-2 rounded-full border ${statusConf.border}`}>
                   <span className={`${statusConf.color} font-bold flex items-center gap-2 text-sm`}>
@@ -365,12 +566,12 @@ export default function TrackShipment() {
                     </div>
                   </div>
                   <div className="flex items-start gap-3">
-                    <div className="bg-orange-50 p-2.5 rounded-full flex-shrink-0">
+                    <div className="bg-orange-50 p-2.5 rounded-full flex-shrink-0 transition-colors">
                       <MapPin className="h-5 w-5 text-brand-orange" />
                     </div>
-                    <div>
+                    <div className="transition-all">
                       <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-0.5">Current Location</p>
-                      <p className="text-gray-900 font-semibold text-sm">{result.current_city}, {result.current_country}</p>
+                      <p className="text-gray-900 font-semibold text-sm transition-colors">{result.current_city}, {result.current_country}</p>
                     </div>
                   </div>
                 </div>
@@ -402,9 +603,9 @@ export default function TrackShipment() {
                 <h3 className="text-lg font-bold text-brand-blue mb-6">Shipment History</h3>
                 <div className="relative border-l-2 border-gray-200 ml-4 space-y-6">
                   {history.map((h, index) => (
-                    <div key={h.id} className="relative pl-8">
+                    <div key={h.id} className="relative pl-8 transition-all">
                       <div className={`absolute -left-[9px] top-1 w-4 h-4 rounded-full border-2 ${
-                        index === history.length - 1
+                        index === history.length - 1 && history.length > 0
                           ? 'bg-brand-orange border-brand-orange'
                           : 'bg-[#0A1F44] border-[#0A1F44]'
                       }`}>
@@ -425,11 +626,11 @@ export default function TrackShipment() {
                     </div>
                   ))}
                   {/* Current location as last entry */}
-                  <div className="relative pl-8">
+                  <div className="relative pl-8 transition-all">
                     <div className="absolute -left-[9px] top-1 w-4 h-4 rounded-full border-2 bg-brand-orange border-brand-orange animate-pulse"></div>
                     <div className="flex flex-col md:flex-row md:justify-between md:items-center gap-1">
                       <div>
-                        <h4 className="font-semibold text-gray-900 text-sm">
+                        <h4 className="font-semibold text-gray-900 text-sm transition-colors">
                           {result.current_city}, {result.current_country}
                         </h4>
                         <p className="text-xs text-brand-orange font-bold">Current Location</p>

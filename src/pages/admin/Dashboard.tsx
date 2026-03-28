@@ -15,6 +15,32 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchStats();
+    
+    // Realtime global subscription for dashboard stats
+    const channel = supabase.channel('admin-dashboard-stats')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipments' }, (payload) => {
+         setStats(prev => {
+           const newStats = { ...prev, total: prev.total + 1 };
+           if (payload.new.status === 'In Transit') newStats.inTransit += 1;
+           if (payload.new.status === 'Delivered') newStats.delivered += 1;
+           if (payload.new.status === 'Delayed') newStats.delayed += 1;
+           return newStats;
+         });
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipments' }, (payload) => {
+         // When updating, we might not get the full "old" object unless Replica Identity Full is enabled.
+         // Given this constraint in most standard Supabase setups, relying on a lightweight background sync
+         // of the COUNT(*) aggregates guarantees data accuracy across all concurrent users modifying stats.
+         fetchStats();
+      })
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipments' }, (payload) => {
+         fetchStats();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
   const fetchStats = async () => {

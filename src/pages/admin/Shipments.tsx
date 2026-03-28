@@ -98,6 +98,35 @@ export default function Shipments() {
     fetchShipments();
   }, [fetchShipments]);
 
+  // Realtime global subscription for admin list
+  useEffect(() => {
+    const channel = supabase.channel('admin-shipments-global')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipments' }, (payload) => {
+         setShipments(prev => {
+           if (statusFilter && payload.new.status !== statusFilter) return prev;
+           return [payload.new as Shipment, ...prev];
+         });
+         setTotalCount(prev => prev + 1);
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipments' }, (payload) => {
+         setShipments(prev => {
+            if (statusFilter && payload.new.status !== statusFilter) {
+                return prev.filter(s => s.id !== payload.new.id);
+            }
+            return prev.map(s => s.id === payload.new.id ? { ...s, ...payload.new } as Shipment : s);
+         });
+      })
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipments' }, (payload) => {
+         setShipments(prev => prev.filter(s => s.id !== payload.old.id));
+         setTotalCount(prev => Math.max(0, prev - 1));
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [statusFilter]);
+
   // Client-side search filter
   const filteredShipments = shipments.filter((s) => {
     if (!search) return true;
