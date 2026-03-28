@@ -335,7 +335,7 @@ Compan</span>
               <div className="flex gap-1 mb-6">
                 {[...Array(5)].map((_, i) => <Star key={i} className="h-5 w-5 fill-brand-orange text-brand-orange" />)}
               </div>
-              <p className="text-gray-700 italic mb-8 relative z-10 leading-relaxed">"Diane Dollar has completely transformed our supply chain. Their real-time tracking and dedicated support team make international shipping a breeze."</p>
+              <p className="text-gray-700 italic mb-8 relative z-10 leading-relaxed">"US Prime Delivery has completely transformed our supply chain. Their real-time tracking and dedicated support team make international shipping a breeze."</p>
               <div className="flex items-center gap-4 border-t border-gray-100 pt-6">
                 <div className="w-12 h-12 bg-[#003380] rounded-full flex items-center justify-center text-white font-bold text-xl shadow-md">S</div>
                 <div>
