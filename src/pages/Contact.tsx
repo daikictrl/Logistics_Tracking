@@ -102,7 +102,7 @@ export default function Contact() {
                       Phone
                     </h3>
                     <p className="text-gray-600 leading-relaxed">
-                      Main: +1 (517) 280-2134
+                      Main: +1 507 250-1753
                       <br />
                       Support: +1 (517) 232-4753
                     </p>
